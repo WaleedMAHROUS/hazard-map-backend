@@ -9,3 +9,4 @@ shapely==2.0.4
 pyproj==3.6.1
 earthengine-api==0.1.405
 geemap==0.32.1
+ipython<8.0
