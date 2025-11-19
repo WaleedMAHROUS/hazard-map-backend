@@ -60,12 +60,6 @@ def get_bbox(lat, lon, radius_km):
     lon_d = radius_km / (R * cos(lat_rad))
     return (degrees(lat_rad - lat_d), degrees(lon_rad - lon_d), degrees(lat_rad + lat_d), degrees(lon_rad + lon_d))
 
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371
-    dLat, dLon = radians(lat2 - lat1), radians(lon2 - lon1)
-    a = sin(dLat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dLon/2)**2
-    return R * 2 * asin(sqrt(a))
-
 def calculate_area(geom):
     try:
         s = shape(geom)
@@ -142,7 +136,7 @@ def fetch_gee_data(lat, lon, radius_m):
     except Exception as e:
         print(f"GEE Error: {e}"); return []
 
-# --- KML GENERATOR (PRO VERSION) ---
+# --- KML GENERATOR ---
 def generate_circle_coords(clat, clon, radius_m, num_points=100):
     coords = []
     for i in range(num_points + 1):
@@ -160,9 +154,9 @@ def generate_files(features, arp, radius_m):
     kml = etree.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
     doc = etree.SubElement(kml, "Document")
     
-    # Pro Styles
+    # Styles
     styles = {
-        "water": ("80ff0000", "ff0000"), # Blue (KML: AABBGGRR)
+        "water": ("80ff0000", "ff0000"), # Blue
         "veg": ("80008000", "008000"),   # Green
         "waste": ("9913458b", "8b4513"), # Brown
         "radius": ("ff0000ff", "ff0000") # Red Line
@@ -174,7 +168,7 @@ def generate_files(features, arp, radius_m):
              etree.SubElement(etree.SubElement(s, "LineStyle"), "width").text = "3"
         else:
             etree.SubElement(etree.SubElement(s, "PolyStyle"), "color").text = poly_c
-            etree.SubElement(etree.SubElement(s, "LineStyle"), "color").text = "ff" + line_c # Solid line
+            etree.SubElement(etree.SubElement(s, "LineStyle"), "color").text = "ff" + line_c
             
     # ARP Marker
     pm = etree.SubElement(doc, "Placemark")
@@ -200,12 +194,6 @@ def generate_files(features, arp, radius_m):
         etree.SubElement(pm, "name").text = name
         etree.SubElement(pm, "styleUrl").text = f"#{t}"
         
-        # Extended Data (Tooltip info)
-        ed = etree.SubElement(pm, "ExtendedData")
-        for key, val in [("Type", name), ("Area", f"{int(area):,} m²")]:
-            d = etree.SubElement(ed, "Data", name=key)
-            etree.SubElement(d, "value").text = val
-
         geom = f['geometry']
         if geom['type'] in ['Polygon', 'MultiPolygon']:
             coords_list = geom['coordinates'][0] if geom['type'] == 'Polygon' else geom['coordinates'][0][0]
@@ -228,30 +216,31 @@ def generate_report():
     try:
         d = request.json
         if d.get('mode') == 'icao':
-            # SAFE ICAO LOOKUP (Modified to prevent crash)
+            # --- FIXED ICAO LOGIC ---
             icao_code = d["icao"].upper().strip()
-            # Query for node, way, or relation (nwr) to catch all airport types
+            print(f"🔎 Looking up ICAO: {icao_code}")
+            
+            # Use 'nwr' (node, way, relation) to find airports that are polygons too
             q = f'[out:json];nwr["icao"="{icao_code}"];out center;'
             
-            print(f"🔎 Looking up ICAO: {icao_code}")
-            overpass_resp = requests.post("https://overpass-api.de/api/interpreter", data={'data': q})
-            
-            if overpass_resp.status_code != 200:
-                return jsonify({"error": "Overpass API Error. Try again later."}), 502
-
-            data = overpass_resp.json()
-            if not data.get('elements'):
-                return jsonify({"error": f"ICAO Code '{icao_code}' not found on OpenStreetMap."}), 404
+            try:
+                overpass_resp = requests.post("https://overpass-api.de/api/interpreter", data={'data': q})
+                data = overpass_resp.json()
                 
-            r = data['elements'][0]
-            # Use 'center' if available (for ways/relations), otherwise lat/lon
-            lat = r.get('center', {}).get('lat', r.get('lat'))
-            lon = r.get('center', {}).get('lon', r.get('lon'))
-            
-            if not lat or not lon:
-                 return jsonify({"error": f"Could not determine coordinates for {icao_code}."}), 404
+                if not data.get('elements'):
+                    return jsonify({"error": f"ICAO Code '{icao_code}' not found on OpenStreetMap."}), 404
+                    
+                r = data['elements'][0]
+                # Use 'center' if available (for polygons), else lat/lon
+                lat = r.get('center', {}).get('lat', r.get('lat'))
+                lon = r.get('center', {}).get('lon', r.get('lon'))
+                
+                if not lat or not lon:
+                    return jsonify({"error": f"Could not determine coordinates for {icao_code}."}), 404
 
-            arp = {"name": icao_code, "lat": lat, "lon": lon}
+                arp = {"name": icao_code, "lat": lat, "lon": lon}
+            except Exception as e:
+                return jsonify({"error": "Failed to contact Map Server. Try Coordinates instead."}), 502
         else:
             arp = {"name": "Custom", "lat": float(d['lat']), "lon": float(d['lon'])}
             
@@ -267,12 +256,11 @@ def generate_report():
             try:
                 s = shape(f['geometry'])
                 area = calculate_area(f['geometry'])
-                if area < min_area and area > 10: continue # Keep small inflated points
+                if area < min_area and area > 10: continue
                 f['properties']['area_sq_m'] = area
                 final.append(f)
                 display.append({"type": "Feature", "properties": f['properties'], "geometry": mapping(s.simplify(0.001))})
-            except Exception as e:
-                print(f"Skipping bad feature: {e}")
+            except: pass
             
         kml, csv = generate_files(final, arp, radius)
         return jsonify({
