@@ -44,6 +44,11 @@ except Exception as e:
 
 # --- HELPER FUNCTIONS ---
 HEADERS = {'User-Agent': 'HabitatScanner/2.0'}
+OVERPASS_SERVERS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://z.overpass-api.de/api/interpreter"
+]
 
 def get_bbox(lat, lon, radius_km):
     R = 6371
@@ -65,6 +70,34 @@ def calculate_area(geom):
             return abs(Geod(ellps='WGS84').geometry_area_perimeter(s)[0])
         return 0 
     except: return 0
+
+def fetch_icao_data(icao):
+    print(f"🔎 Searching for ICAO: {icao}")
+    q = f"""[out:json][timeout:15];(node["icao"="{icao.upper()}"];way["icao"="{icao.upper()}"];relation["icao"="{icao.upper()}"];);out center;"""
+    
+    for server in OVERPASS_SERVERS:
+        try:
+            print(f"   -> Trying server: {server}")
+            r = requests.post(server, data={'data': q}, headers=HEADERS, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get('elements'):
+                    el = data['elements'][0]
+                    lat = el.get('lat') or el.get('center', {}).get('lat')
+                    lon = el.get('lon') or el.get('center', {}).get('lon')
+                    if lat and lon: 
+                        print(f"✅ Found {icao} at {lat}, {lon}")
+                        return {"name": f"{icao} Airport", "lat": lat, "lon": lon}
+                else:
+                     print(f"   -> No data found on {server}")
+            else:
+                print(f"   -> Server returned status {r.status_code}")
+        except Exception as e: 
+            print(f"   -> Error on {server}: {e}")
+            continue
+            
+    # If loop finishes without returning, it failed everywhere
+    raise Exception(f"Airport {icao} not found on any OSM server. Please check the code or use coordinates.")
 
 # --- CUSTOM PARSER (No external libs) ---
 def osm_to_geojson_custom(osm_json):
@@ -101,19 +134,27 @@ def fetch_osm_data(lat, lon, radius_m):
     print("🏗️ Fetching OSM...")
     s, w, n, e = get_bbox(lat, lon, (radius_m/1000)+1)
     q = f"""[out:json][timeout:45];(nwr["landuse"~"landfill|industrial|brownfield|reservoir|basin"]({s},{w},{n},{e});nwr["amenity"~"waste_disposal|slaughterhouse"]({s},{w},{n},{e});nwr["natural"~"water|wetland"]({s},{w},{n},{e}););out body;>;out skel qt;"""
-    try:
-        resp = requests.post("https://overpass-api.de/api/interpreter", data={'data': q}, headers=HEADERS)
-        if resp.status_code != 200: return []
-        feats = osm_to_geojson_custom(resp.json())
-        for f in feats:
-            p = f['properties']
-            f['properties']['custom_type'] = 'water' if 'water' in str(p) or 'reservoir' in str(p) else 'waste'
-            if f['geometry']['type'] == 'Point':
-                f['geometry'] = mapping(shape(f['geometry']).buffer(0.0005)) # Inflate points
-        print(f"   -> OSM found {len(feats)}")
-        return feats
-    except Exception as e:
-        print(f"OSM Error: {e}"); return []
+    
+    for server in OVERPASS_SERVERS:
+        try:
+            resp = requests.post(server, data={'data': q}, headers=HEADERS, timeout=45)
+            if resp.status_code != 200: continue
+            
+            feats = osm_to_geojson_custom(resp.json())
+            for f in feats:
+                p = f['properties']
+                f['properties']['custom_type'] = 'water' if 'water' in str(p) or 'reservoir' in str(p) else 'waste'
+                if f['geometry']['type'] == 'Point':
+                    f['geometry'] = mapping(shape(f['geometry']).buffer(0.0005)) # Inflate points
+            
+            print(f"   -> OSM found {len(feats)}")
+            return feats # Return immediately on success
+        except Exception as e:
+            print(f"OSM Query Error on {server}: {e}")
+            continue
+            
+    print("❌ All OSM servers failed.")
+    return []
 
 def fetch_gee_data(lat, lon, radius_m):
     if not GEE_ENABLED: return []
@@ -154,8 +195,10 @@ def generate_files(features, arp):
         etree.SubElement(pm, "styleUrl").text = f"#{t}"
         
         # CSV
-        c = shape(f['geometry']).centroid
-        rows.append({"Type": name, "Area": area, "Lat": c.y, "Lon": c.x})
+        try:
+            c = shape(f['geometry']).centroid
+            rows.append({"Type": name, "Area": area, "Lat": c.y, "Lon": c.x})
+        except: pass
         
     return etree.tostring(kml).decode(), pd.DataFrame(rows).to_csv(index=False)
 
@@ -165,23 +208,21 @@ def generate_report():
     if request.method == 'OPTIONS': return jsonify({"status": "ok"}), 200
     try:
         d = request.json
+        radius = float(d.get('radius_km', 13)) * 1000
+        min_area = float(d.get('min_area_sq_m', 5000))
+
         if d.get('mode') == 'icao':
-            q = f'[out:json];node["icao"="{d["icao"].upper()}"];out center;'
-            r = requests.post("https://overpass-api.de/api/interpreter", data={'data': q}).json()['elements'][0]
-            arp = {"name": d["icao"], "lat": r['lat'], "lon": r['lon']}
+            arp = fetch_icao_data(d.get('icao'))
         else:
             arp = {"name": "Custom", "lat": float(d['lat']), "lon": float(d['lon'])}
             
-        radius = float(d.get('radius_km', 13)) * 1000
-        min_area = float(d.get('min_area_sq_m', 5000))
-        
         raw = fetch_osm_data(arp['lat'], arp['lon'], radius) + fetch_gee_data(arp['lat'], arp['lon'], radius)
         
         final, display = [], []
         for f in raw:
             s = shape(f['geometry'])
             area = calculate_area(f['geometry'])
-            if area < min_area and area > 10: continue # Keep small inflated points
+            if area < min_area and area > 10: continue 
             f['properties']['area_sq_m'] = area
             final.append(f)
             display.append({"type": "Feature", "properties": f['properties'], "geometry": mapping(s.simplify(0.001))})
