@@ -228,25 +228,51 @@ def generate_report():
     try:
         d = request.json
         if d.get('mode') == 'icao':
-            q = f'[out:json];node["icao"="{d["icao"].upper()}"];out center;'
-            r = requests.post("https://overpass-api.de/api/interpreter", data={'data': q}).json()['elements'][0]
-            arp = {"name": d["icao"], "lat": r['lat'], "lon": r['lon']}
+            # SAFE ICAO LOOKUP (Modified to prevent crash)
+            icao_code = d["icao"].upper().strip()
+            # Query for node, way, or relation (nwr) to catch all airport types
+            q = f'[out:json];nwr["icao"="{icao_code}"];out center;'
+            
+            print(f"🔎 Looking up ICAO: {icao_code}")
+            overpass_resp = requests.post("https://overpass-api.de/api/interpreter", data={'data': q})
+            
+            if overpass_resp.status_code != 200:
+                return jsonify({"error": "Overpass API Error. Try again later."}), 502
+
+            data = overpass_resp.json()
+            if not data.get('elements'):
+                return jsonify({"error": f"ICAO Code '{icao_code}' not found on OpenStreetMap."}), 404
+                
+            r = data['elements'][0]
+            # Use 'center' if available (for ways/relations), otherwise lat/lon
+            lat = r.get('center', {}).get('lat', r.get('lat'))
+            lon = r.get('center', {}).get('lon', r.get('lon'))
+            
+            if not lat or not lon:
+                 return jsonify({"error": f"Could not determine coordinates for {icao_code}."}), 404
+
+            arp = {"name": icao_code, "lat": lat, "lon": lon}
         else:
             arp = {"name": "Custom", "lat": float(d['lat']), "lon": float(d['lon'])}
             
         radius = float(d.get('radius_km', 13)) * 1000
         min_area = float(d.get('min_area_sq_m', 5000))
         
+        print(f"📍 Processing {arp['name']} at {arp['lat']}, {arp['lon']}")
+        
         raw = fetch_osm_data(arp['lat'], arp['lon'], radius) + fetch_gee_data(arp['lat'], arp['lon'], radius)
         
         final, display = [], []
         for f in raw:
-            s = shape(f['geometry'])
-            area = calculate_area(f['geometry'])
-            if area < min_area and area > 10: continue # Keep small inflated points
-            f['properties']['area_sq_m'] = area
-            final.append(f)
-            display.append({"type": "Feature", "properties": f['properties'], "geometry": mapping(s.simplify(0.001))})
+            try:
+                s = shape(f['geometry'])
+                area = calculate_area(f['geometry'])
+                if area < min_area and area > 10: continue # Keep small inflated points
+                f['properties']['area_sq_m'] = area
+                final.append(f)
+                display.append({"type": "Feature", "properties": f['properties'], "geometry": mapping(s.simplify(0.001))})
+            except Exception as e:
+                print(f"Skipping bad feature: {e}")
             
         kml, csv = generate_files(final, arp, radius)
         return jsonify({
