@@ -280,32 +280,41 @@ def generate_report():
         min_area = float(d.get('min_area_sq_m', 5000))
         
         print(f"📍 Processing {arp['name']} at {arp['lat']}, {arp['lon']}")
+        print(f"   -> Minimum area threshold: {min_area} m²")
         raw = fetch_osm_data(arp['lat'], arp['lon'], radius) + fetch_gee_data(arp['lat'], arp['lon'], radius)
         
         print(f"   -> Total raw features fetched: {len(raw)}")
         
         final, display = [], []
         filtered_count = 0
+        invalid_count = 0
         
         for f in raw:
             try:
                 s = shape(f['geometry'])
+                
+                # Validate geometry first
+                if not s.is_valid or s.is_empty:
+                    invalid_count += 1
+                    print(f"   -> Skipping invalid/empty geometry")
+                    continue
+                
                 area = calculate_area(f['geometry'])
                 
-                # CORRECTED LOGIC: Skip features that are too small
-                # Only keep features that meet BOTH conditions:
-                # 1. Area is >= min_area (user's minimum threshold)
-                # 2. Area is >= 10 (reasonable minimum to avoid tiny artifacts)
-                if area < min_area:
+                # FIXED LOGIC: Only filter based on min_area threshold
+                # If min_area is 0, keep all valid features regardless of size
+                if min_area > 0 and area < min_area:
                     filtered_count += 1
                     continue
                 
+                # Store the calculated area
                 f['properties']['area_sq_m'] = area
                 final.append(f)
                 
-                # Create simplified version for display (but keep all valid features)
+                # Create simplified version for display
                 try:
-                    simplified_geom = s.simplify(0.0005)  # Less aggressive simplification
+                    # Use less aggressive simplification to preserve features
+                    simplified_geom = s.simplify(0.0003, preserve_topology=True)
                     if simplified_geom.is_valid and not simplified_geom.is_empty:
                         display.append({
                             "type": "Feature", 
@@ -313,31 +322,36 @@ def generate_report():
                             "geometry": mapping(simplified_geom)
                         })
                     else:
-                        # If simplification fails, use original
+                        # If simplification creates invalid geometry, use original
                         display.append({
                             "type": "Feature", 
                             "properties": f['properties'], 
                             "geometry": mapping(s)
                         })
-                except:
+                except Exception as simp_err:
                     # If simplification fails, use original geometry
+                    print(f"   -> Simplification failed, using original: {simp_err}")
                     display.append({
                         "type": "Feature", 
                         "properties": f['properties'], 
                         "geometry": mapping(s)
                     })
             except Exception as e:
+                invalid_count += 1
                 print(f"   -> Skipping invalid feature: {e}")
                 pass
         
         print(f"   -> Features after filtering: {len(final)}")
-        print(f"   -> Features filtered out (too small): {filtered_count}")
+        print(f"   -> Features filtered (too small): {filtered_count}")
+        print(f"   -> Features invalid (bad geometry): {invalid_count}")
         print(f"   -> Display features: {len(display)}")
             
         kml, csv = generate_files(final, arp, radius)
         return jsonify({
             "message": "Success", 
             "feature_count": len(final), 
+            "filtered_count": filtered_count,
+            "invalid_count": invalid_count,
             "airport_info": arp,
             "map_geojson": {"type": "FeatureCollection", "features": display},
             "kml_string": kml, 
