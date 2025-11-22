@@ -17,7 +17,7 @@ CORS(app)
 # --- AUTHENTICATION ---
 GEE_ENABLED = False
 try:
-    print("🔑 Checking Authentication...")
+    print("🔒 Checking Authentication...")
     service_account_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
     
     if service_account_json:
@@ -107,7 +107,7 @@ def osm_to_geojson_custom(osm_json):
 
 # --- DATA MINING ---
 def fetch_osm_data(lat, lon, radius_m):
-    print("🏗️ Fetching OSM...")
+    print("🗺️ Fetching OSM...")
     s, w, n, e = get_bbox(lat, lon, (radius_m/1000)+1)
     q = f"""[out:json][timeout:45];(nwr["landuse"~"landfill|industrial|brownfield|reservoir|basin"]({s},{w},{n},{e});nwr["amenity"~"waste_disposal|slaughterhouse"]({s},{w},{n},{e});nwr["natural"~"water|wetland"]({s},{w},{n},{e}););out body;>;out skel qt;"""
     try:
@@ -282,22 +282,66 @@ def generate_report():
         print(f"📍 Processing {arp['name']} at {arp['lat']}, {arp['lon']}")
         raw = fetch_osm_data(arp['lat'], arp['lon'], radius) + fetch_gee_data(arp['lat'], arp['lon'], radius)
         
+        print(f"   -> Total raw features fetched: {len(raw)}")
+        
         final, display = [], []
+        filtered_count = 0
+        
         for f in raw:
             try:
                 s = shape(f['geometry'])
                 area = calculate_area(f['geometry'])
-                if area < min_area and area > 10: continue
+                
+                # CORRECTED LOGIC: Skip features that are too small
+                # Only keep features that meet BOTH conditions:
+                # 1. Area is >= min_area (user's minimum threshold)
+                # 2. Area is >= 10 (reasonable minimum to avoid tiny artifacts)
+                if area < min_area:
+                    filtered_count += 1
+                    continue
+                
                 f['properties']['area_sq_m'] = area
                 final.append(f)
-                display.append({"type": "Feature", "properties": f['properties'], "geometry": mapping(s.simplify(0.001))})
-            except: pass
+                
+                # Create simplified version for display (but keep all valid features)
+                try:
+                    simplified_geom = s.simplify(0.0005)  # Less aggressive simplification
+                    if simplified_geom.is_valid and not simplified_geom.is_empty:
+                        display.append({
+                            "type": "Feature", 
+                            "properties": f['properties'], 
+                            "geometry": mapping(simplified_geom)
+                        })
+                    else:
+                        # If simplification fails, use original
+                        display.append({
+                            "type": "Feature", 
+                            "properties": f['properties'], 
+                            "geometry": mapping(s)
+                        })
+                except:
+                    # If simplification fails, use original geometry
+                    display.append({
+                        "type": "Feature", 
+                        "properties": f['properties'], 
+                        "geometry": mapping(s)
+                    })
+            except Exception as e:
+                print(f"   -> Skipping invalid feature: {e}")
+                pass
+        
+        print(f"   -> Features after filtering: {len(final)}")
+        print(f"   -> Features filtered out (too small): {filtered_count}")
+        print(f"   -> Display features: {len(display)}")
             
         kml, csv = generate_files(final, arp, radius)
         return jsonify({
-            "message": "Success", "feature_count": len(final), "airport_info": arp,
+            "message": "Success", 
+            "feature_count": len(final), 
+            "airport_info": arp,
             "map_geojson": {"type": "FeatureCollection", "features": display},
-            "kml_string": kml, "csv_string": csv
+            "kml_string": kml, 
+            "csv_string": csv
         })
     except Exception as e:
         print(f"CRITICAL: {e}")
