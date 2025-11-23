@@ -7,3 +7,4 @@ pyproj
 lxml
 earthengine-api
 Flask-Caching
+gunicorn
